@@ -91,8 +91,9 @@ const stores = createAgentCoreMemoryStores({
 })
 ```
 
-This builds a single write-only store: conversation turns are persisted with `createEvent`, but no
-long-term records are extracted or retrieved (its `search()` always returns no results).
+This builds a single write-only store: conversation turns are persisted with `createEvent`. With no
+long-term strategies configured on the Memory resource, no long-term records are extracted. This store
+does not retrieve long-term records; its `search()` always returns no results.
 
 See [`src/memory/integrations/strands/README.md`](../src/memory/integrations/strands/index.ts) for the read-target arms
 (`namespace` exact vs `namespacePath` subtree), `minScore`, the `extraction` switch, recall-only setup, and the full factory surface.

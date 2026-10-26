@@ -3,7 +3,16 @@ import type { BedrockAgentCoreClient } from '@aws-sdk/client-bedrock-agentcore'
 import { createAgentCoreMemoryStores, assertWritableTopology } from '../factory.js'
 import type { CreateAgentCoreMemoryStoresInput } from '../factory.js'
 import { AgentCoreMemoryStore } from '../store.js'
-import { ExtractionTrigger, type ExtractionTriggerContext, type MemoryContentBlockType } from '@strands-agents/sdk'
+import {
+  Agent,
+  BedrockModel,
+  MemoryManager,
+  InvocationTrigger,
+  ExtractionTrigger,
+  type ExtractionTriggerContext,
+  type MemoryContentBlockType,
+  type ModelStreamEvent,
+} from '@strands-agents/sdk'
 
 const fakeClient = { send: vi.fn(async () => ({})) } as unknown as BedrockAgentCoreClient
 
@@ -204,6 +213,59 @@ describe('createAgentCoreMemoryStores - short-term-only (no namespaces)', () => 
     expect(sent).toHaveLength(0)
   })
 
+  it.each([
+    { extraction: true as const, turns: 5 },
+    { extraction: { cadence: new InvocationTrigger() }, turns: 1 },
+  ])('persists through MemoryManager after $turns invocation(s)', async ({ extraction, turns }) => {
+    const { sent, client } = captureClient()
+    const stores = createAgentCoreMemoryStores({ ...stmInput(client), extraction })
+    const manager = new MemoryManager({ stores })
+    const model = new BedrockModel({ region: 'us-west-2' })
+    const stream = vi.spyOn(model, 'stream').mockImplementation(replyStream)
+    const agent = new Agent({ model, memoryManager: manager, printer: false })
+
+    for (let turn = 0; turn < turns; turn++) {
+      expect(sent).toHaveLength(0)
+      await agent.invoke('hello')
+    }
+
+    await vi.waitFor(() => expect(sent).toHaveLength(1))
+    await manager.flush()
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.constructor.name).toBe('CreateEventCommand')
+    expect(sent[0]!.input).toMatchObject({
+      memoryId: 'mem-1',
+      actorId: 'actor-1',
+      sessionId: 'sess-1',
+      payload: Array.from({ length: turns }, () => [
+        { conversational: { role: 'USER', content: { text: 'hello' } } },
+        { conversational: { role: 'ASSISTANT', content: { text: 'reply' } } },
+      ]).flat(),
+    })
+    await expect(manager.search('anything')).resolves.toEqual([])
+    expect(sent).toHaveLength(1)
+    expect(stream).toHaveBeenCalledTimes(turns)
+  })
+
+  it('flush persists a pending turn before the default cadence without duplicate writes', async () => {
+    const { sent, client } = captureClient()
+    const manager = new MemoryManager({ stores: createAgentCoreMemoryStores(stmInput(client)) })
+    const model = new BedrockModel({ region: 'us-west-2' })
+    vi.spyOn(model, 'stream').mockImplementation(replyStream)
+    const agent = new Agent({ model, memoryManager: manager, printer: false })
+
+    await agent.invoke('hello')
+    expect(sent).toHaveLength(0)
+    await manager.flush()
+    expect(sent).toHaveLength(1)
+    expect(sent[0]!.input.payload).toEqual([
+      { conversational: { role: 'USER', content: { text: 'hello' } } },
+      { conversational: { role: 'ASSISTANT', content: { text: 'reply' } } },
+    ])
+    await manager.flush()
+    expect(sent).toHaveLength(1)
+  })
+
   it('throws when namespaces is empty and extraction is disabled (nothing to read or write)', () => {
     expect(() => createAgentCoreMemoryStores(baseInput({ namespaces: [], extraction: false }))).toThrow(
       /nothing to read or write/
@@ -287,3 +349,11 @@ describe('assertWritableTopology', () => {
     expect(() => assertWritableTopology([store()], false)).not.toThrow()
   })
 })
+
+async function* replyStream(): AsyncGenerator<ModelStreamEvent> {
+  yield { type: 'modelMessageStartEvent', role: 'assistant' }
+  yield { type: 'modelContentBlockStartEvent' }
+  yield { type: 'modelContentBlockDeltaEvent', delta: { type: 'textDelta', text: 'reply' } }
+  yield { type: 'modelContentBlockStopEvent' }
+  yield { type: 'modelMessageStopEvent', stopReason: 'endTurn' }
+}
